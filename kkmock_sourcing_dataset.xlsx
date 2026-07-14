@@ -1,0 +1,190 @@
+"""
+AI in the analytical pipeline (not decorative)
+==============================================
+Two genuine uses of an LLM inside the workflow, plus honest fallbacks.
+
+  (1) classify_notes()      — theme + sentiment classification of free-text
+                              recruiter notes. Generalizes to unseen text.
+  (2) recommend_candidate() — a recruiter-facing "insist vs. drop" copilot:
+                              given a candidate's scores and the persistence
+                              model's probability, produce a plain-language
+                              recommendation.
+
+Honesty
+-------
+* This dataset's `recruiter_notes` are 11 fixed template phrases, so on THIS
+  data the LLM only proves the pipeline works — there is no real free text to
+  generalize over. The value transfers to real, varied recruiter notes.
+* If ANTHROPIC_API_KEY is not set (or the `anthropic` package is absent), both
+  functions fall back to a transparent, deterministic rule set so the whole
+  repo runs end-to-end with zero external dependencies. The fallback is clearly
+  labeled in the returned payload (`"engine": "rules"` vs `"engine": "llm"`).
+* The persistence probability itself comes from the from-scratch logistic
+  regression in analysis.py — the LLM only *explains* it. The LLM is never the
+  source of a number that drives a decision.
+
+Set MODEL below to whatever Claude model string your account has access to.
+Check current model names in the Anthropic docs before running with the API.
+"""
+from __future__ import annotations
+import os, json
+
+MODEL = "claude-sonnet-4-5"  # verify the exact available model id in Anthropic docs
+
+# 11 fixed phrases -> (theme, sentiment). Mirrors analysis.THEME_MAP and serves
+# as the offline fallback for classify_notes(). Dict KEYS are the literal
+# Portuguese phrases as they appear in the dataset's recruiter_notes column
+# (data values, not UI text) — they must match verbatim to look up correctly.
+_RULES = {
+    "Baixa responsividade nas etapas iniciais.": ("Engagement/Responsiveness", "Negative"),
+    "Pediu prazo adicional para retorno.": ("Responsiveness/Timing", "Neutral-negative"),
+    "Demonstrou interesse claro na oportunidade.": ("Engagement", "Positive"),
+    "Pontos fortes em execução e autonomia.": ("Behavioral fit", "Positive"),
+    "Perfil técnico acima da média.": ("Technical fit", "Positive"),
+    "Apresentou aderência forte ao contexto da vaga.": ("Cultural/role fit", "Positive"),
+    "Experiência sólida, mas expectativa salarial alta.": ("Salary risk", "Mixed"),
+    "Bom potencial de evolução.": ("Potential", "Positive"),
+    "Feedback positivo do gestor.": ("Manager evaluation", "Positive"),
+    "Boa comunicação e resposta rápida.": ("Communication", "Positive"),
+    "Perfil com forte aderência e processo acelerado.": ("Fit + fast process", "Positive"),
+}
+
+
+def _get_client():
+    """Return an Anthropic client if possible, else None (=> use fallback)."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import anthropic
+        return anthropic.Anthropic()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# (1) TEXT CLASSIFICATION
+# ---------------------------------------------------------------------------
+def classify_notes(notes):
+    """
+    notes: iterable of strings.
+    Returns {"engine": "llm"|"rules", "classified": [{note, theme, sentiment}, ...]}.
+    Only the UNIQUE notes are sent to the LLM (cost-efficient), then mapped back.
+    """
+    unique = sorted(set(str(n) for n in notes))
+    client = _get_client()
+
+    if client is None:
+        classified = [{"note": n, **_classify_one_rule(n)} for n in unique]
+        return {"engine": "rules", "classified": classified}
+
+    prompt = (
+        "You classify recruiter notes (Brazilian Portuguese source text). For each note, "
+        "return a theme (short English label) and a sentiment in {Positive, Neutral, "
+        "Neutral-negative, Mixed, Negative}. Respond ONLY with a JSON array of objects "
+        '{"note","theme","sentiment"} — no prose, no markdown.\n\nNotes:\n'
+        + json.dumps(unique, ensure_ascii=False)
+    )
+    try:
+        msg = client.messages.create(
+            model=MODEL, max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        arr = json.loads(text)
+        return {"engine": "llm", "classified": arr}
+    except Exception as e:
+        # Fail safe and transparent: never crash the pipeline on an API hiccup.
+        classified = [{"note": n, **_classify_one_rule(n)} for n in unique]
+        return {"engine": "rules", "classified": classified, "llm_error": str(e)}
+
+
+def _classify_one_rule(note):
+    theme, sent = _RULES.get(note, ("Other", "Neutral"))
+    return {"theme": theme, "sentiment": sent}
+
+
+# ---------------------------------------------------------------------------
+# (2) RECRUITER DECISION COPILOT
+# ---------------------------------------------------------------------------
+def recommend_candidate(candidate: dict, prob_hire: float) -> dict:
+    """
+    candidate: dict with keys technical_test_score, behavior_score, manager_score,
+               response_time_days, seniority, source_channel (any subset).
+    prob_hire: probability from the persistence logistic model (0..1).
+    Returns {"engine", "decision", "rationale"}.
+
+    The DECISION is derived from explicit, auditable thresholds (not the LLM),
+    grounded in this project's findings:
+      - technical_test_score <= 70  -> strong 'drop' signal (0% hired below/at 70)
+      - prob_hire >= 0.5            -> 'insist'
+      - else                        -> 'evaluate'
+    The LLM only phrases the rationale for the recruiter.
+    """
+    tech = candidate.get("technical_test_score")
+    if tech is not None and tech <= 70:
+        decision = "Drop / deprioritize"
+    elif prob_hire >= 0.5:
+        decision = "Insist (priority follow-up)"
+    else:
+        decision = "Evaluate cautiously"
+
+    client = _get_client()
+    if client is None:
+        return {"engine": "rules", "decision": decision,
+                "rationale": _rationale_rule(candidate, prob_hire, decision)}
+
+    prompt = (
+        "You are an HR copilot. In 2 sentences, in English, explain to a "
+        "recruiter why this candidate got the decision below. Be concrete, cite the "
+        "strongest signal, and avoid inventing facts.\n"
+        f"Decision (fixed, do not change): {decision}\n"
+        f"Persistence probability: {prob_hire:.2f}\n"
+        f"Candidate data: {json.dumps(candidate, ensure_ascii=False)}\n"
+        "Findings context: technical score <=70 historically converts at 0%; technical "
+        "and behavioral scores are the strongest predictors; response speed barely matters."
+    )
+    try:
+        msg = client.messages.create(model=MODEL, max_tokens=300,
+                                     messages=[{"role": "user", "content": prompt}])
+        rationale = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        return {"engine": "llm", "decision": decision, "rationale": rationale}
+    except Exception as e:
+        return {"engine": "rules", "decision": decision,
+                "rationale": _rationale_rule(candidate, prob_hire, decision), "llm_error": str(e)}
+
+
+def _rationale_rule(c, p, decision):
+    tech = c.get("technical_test_score")
+    if tech is not None and tech <= 70:
+        return (f"Technical score {tech} is at the threshold (≤70) that never converted "
+                "in this dataset — the strongest signal weighs against insisting.")
+    if p >= 0.5:
+        return (f"Estimated hire probability {p:.0%}, driven by technical score "
+                f"({c.get('technical_test_score','?')}) and behavioral score ({c.get('behavior_score','?')}) — "
+                "worth prioritizing the follow-up.")
+    return (f"Estimated probability {p:.0%}: above the technical cut-off, but without a strong "
+            "enough signal to prioritize — evaluate against other candidates for the role.")
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import pandas as pd
+    from analysis import load_data
+    df = load_data()
+
+    res = classify_notes(df["recruiter_notes"].tolist())
+    print(f"[classify_notes] engine={res['engine']} — {len(res['classified'])} unique phrases classified")
+    for row in res["classified"][:4]:
+        print("  ", row)
+
+    demo = {"technical_test_score": 82, "behavior_score": 78, "manager_score": 71,
+            "response_time_days": 3, "seniority": "Pleno", "source_channel": "Github"}
+    rec = recommend_candidate(demo, prob_hire=0.62)
+    print(f"\n[recommend_candidate] engine={rec['engine']}")
+    print("  decision:", rec["decision"])
+    print("  rationale:", rec["rationale"])
+    print("\n(With no ANTHROPIC_API_KEY set, the pipeline uses the deterministic fallback — "
+          "'engine=rules'. Set the key to use the real LLM.)")

@@ -1,0 +1,97 @@
+# AI usage in the product — how the LLM fits into the pipeline
+
+AI here **doesn't write the report**. It's a product component. The number
+(Priority Score) and the reasons are **deterministic and auditable** — they
+come from `src/decision_engine.py`. The LLM enters at three points, always
+*after* the statistics, to make the result usable by a recruiter.
+
+Golden rule: **the LLM never produces a number that drives a decision.** It
+translates, summarizes, and explains. If the API isn't configured, everything
+falls back to a deterministic path (`engine: "rules"`), so the product runs
+with no key at all.
+
+---
+
+## 1. Explaining the recommendation in plain language
+
+**Where:** `ai_pipeline.recommend_candidate()`. The LLM receives a decision
+already made (by the rule) and justifies it for the recruiter.
+
+**Prompt (abridged):**
+```
+You are an HR copilot. In 2 sentences, in English, explain to a recruiter why
+this candidate got the decision below. Be concrete, cite the strongest signal,
+and avoid inventing facts.
+Decision (fixed, do not change): {decision}
+Priority Score: {score}/100 · Confidence: {confidence}
+Candidate data: {json}
+Findings context: technical score <=70 historically converts at 0%; technical
+and behavioral scores are the strongest predictors; response speed barely matters.
+```
+
+**Why it's safe:** the decision and score are passed in already resolved; the
+LLM only puts them into words. Number hallucination is structurally impossible.
+
+---
+
+## 2. Classifying unstructured text (recruiter notes)
+
+**Where:** `ai_pipeline.classify_notes()`. Classifies each note by theme +
+sentiment. Generalizes to real free text (the synthetic dataset only has 11
+fixed phrases, in their original Portuguese as entered by recruiters).
+
+**Prompt (abridged):**
+```
+You classify recruiter notes (Brazilian Portuguese source text). For each
+note, return a theme (short English label) and a sentiment in {Positive,
+Neutral, Neutral-negative, Mixed, Negative}. Respond ONLY with a JSON array of
+objects {"note","theme","sentiment"} — no prose, no markdown.
+Notes: [...]
+```
+
+**Validation:** the LLM's output is cross-checked against hire rate by
+theme/sentiment. In this dataset there's no gradient (3.6%–14%), and the
+product **reports that honestly** instead of forcing a signal.
+
+---
+
+## 3. Summarizing patterns for leadership / hiring managers
+
+**Where:** on-demand use (e.g., generating the "Top insights" text or a weekly
+summary). The LLM receives the **already-computed aggregate tables** and
+writes the summary.
+
+**Prompt (example):**
+```
+Here are aggregated recruiting metrics (already computed, do not recalculate):
+{funnel table, channels, recruiters, rejection reasons}.
+Write a 5-bullet executive summary for a hiring manager. Each bullet: one
+finding + one action. Don't invent numbers outside the table. Explicitly flag
+any pattern based on a small sample (n<30) as "directional, not conclusive".
+```
+
+**Why it works:** the LLM only receives verified data and the instruction to
+flag uncertainty — the same discipline as the rest of the project.
+
+---
+
+## 4. (Optional) Generating hypotheses for investigation
+
+The LLM can suggest hypotheses ("does Github convert better because it brings
+in profile X?"), but **every hypothesis is statistically validated before
+becoming a recommendation** (e.g., the channel × seniority cross-check that
+tested the confounder). The LLM speeds up hypothesis generation; it isn't the
+source of the conclusion.
+
+---
+
+## Configuration
+
+```bash
+export ANTHROPIC_API_KEY=...   # without this, uses the deterministic fallback
+python src/ai_pipeline.py       # demo of both uses
+```
+
+The model identifier (`MODEL` in `ai_pipeline.py`) should be checked against
+current Anthropic documentation before running against the real API — model
+names change.

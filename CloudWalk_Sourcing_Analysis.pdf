@@ -1,0 +1,117 @@
+# Data Understanding & Cleaning
+
+Covers steps 1 (*Data Understanding*) and 2 (*Data Cleaning*) of the case. The
+checks live in code in `src/analysis.py` (the `audit` function); this document
+explains what they find and **why** each cleaning decision was made.
+
+> Honesty reminder: **synthetic** dataset, 601 candidates × 35 columns,
+> 100 requisitions, 6 recruiters, 8 channels, 193 hiring managers. Numbers are
+> valid within the dataset; what transfers is the methodology.
+
+---
+
+## 1. Data dictionary (likely meaning)
+
+Identification and role: `candidate_id` (int, unique), `candidate_name`,
+`candidate_email` (PII — never used as features), `requisition_id`, `role`,
+`department`, `location`, `work_mode`, `seniority` (Junior/Pleno/Senior/Staff),
+`years_experience` (float), `hiring_manager`, `recruiter` (6 names),
+`source_channel` (8 channels), `decision_source`.
+
+Funnel dates: `sourced_date`, `first_contact_date`, `screening_date`,
+`interview1_date`, `test_date`, `offer_date`, `hired_date`. Null when the stage
+didn't happen — the null pattern **encodes funnel progress**, it isn't an error.
+
+Stage flags (bool): `response_received`, `screening_pass`, `interview1_pass`,
+`test_taken`, `offer_sent`, `hired`. `final_stage` summarizes the final stage.
+
+Scores: `technical_test_score`, `behavior_score`, `manager_score` (int 0–100).
+
+Metrics/derived: `response_time_days` (float), `stage_duration_days` (int),
+`rejection_reason` (categorical, null when not rejected), `recruiter_notes`
+(semi-structured text).
+
+---
+
+## 2. Types and nulls (observed)
+
+All 35 columns were inspected (`df.dtypes` + null counts). Nulls **aren't
+random** — they follow the funnel:
+
+| Column | Nulls | Interpretation |
+|---|---:|---|
+| `response_time_days` | 192 | ≈ those who never responded |
+| `screening_date` | 293 | didn't make it past screening |
+| `interview1_date` | 367 | didn't reach the interview |
+| `test_date` | 400 | didn't take the test |
+| `offer_date` | 539 | didn't receive an offer |
+| `hired_date` | 552 | not hired (601−49) |
+| `rejection_reason` | 226 | ~37.6%: hires + still in process |
+
+**Decision:** date/reason nulls are **structural** — don't impute. Filling them in
+would create events that never happened. They're read via boolean flags instead.
+
+---
+
+## 3. Data-quality issues found (and decision)
+
+**a) Score data leakage (the most important one).** `technical_test_score`,
+`behavior_score` and `manager_score` come filled for **all 601**, including the
+400 who never took the test. Confirmed: the average technical score barely
+changes between those who took the test and those who didn't. Using the score
+on the full base leaks signal from stages that never happened.
+→ **Decision:** every score analysis **filters to the eligible population** by
+`test_taken` / `interview1_pass`. Without this, the 70 cut-off and the
+regression are invalid.
+
+**b) Duplicates.** `candidate_id` is unique (601 values). No candidate
+duplication.
+→ **Decision:** no deduplication needed.
+
+**c) Funnel monotonicity violation.** 1 case in 601 advances a stage without
+the previous one (e.g., screening with no response recorded).
+→ **Decision:** flagged; doesn't affect aggregates (0.17%). In production this
+would become an input-validation rule.
+
+**d) Negative `stage_duration_days`.** 1 record with negative duration
+(inconsistent dates).
+→ **Decision:** flagged and excluded from duration statistics; kept in the
+rest (doesn't contaminate conversion rates).
+
+**e) `recruiter_notes` is semi-structured.** Only **11 fixed distinct phrases**,
+not free text.
+→ **Decision:** the text analysis (and the AI) is still run, but the result is
+reported with the caveat that the synthetic dataset **doesn't support** a real
+text signal — instead of forcing a conclusion.
+
+**f) PII.** Name and email are personal data.
+→ **Decision:** never used as features or shown as a decision factor; they
+only appear as identification labels in the interface.
+
+---
+
+## 4. Transformations applied (cleaning)
+
+1. **Date parsing** to `datetime` (done at read time) — enables `time-to-hire`
+   (`hired_date − sourced_date`) and duration calculations.
+2. **Eligible population per stage** for any post-stage feature (anti-leakage).
+3. **Ordinal encoding** of `seniority` (Junior=1 … Staff=4) for the models.
+4. **Leave-one-out (LOO) target encoding** of `source_channel` and `recruiter`
+   in the decision engine — removes a candidate's own outcome from their
+   group's rate, avoiding feature leakage.
+5. **No imputation** of structural nulls (see §2).
+
+No row is silently dropped; the 2 records with a point-in-time error (c, d)
+are flagged and isolated only from the statistics they would distort.
+
+---
+
+## 5. Limitations (explicit)
+
+- Synthetic dataset → zero external validity; the value is in the methodology.
+- Rare positive class (49/601 = 8.2%) → models evaluated by coefficient
+  hierarchy and separation, not raw accuracy.
+- Several channel/recruiter × seniority cells are small (n<30) → read as
+  directional, not a closed conclusion.
+- Recruiter notes have low entropy (11 phrases) → the text test is limited by
+  construction.
