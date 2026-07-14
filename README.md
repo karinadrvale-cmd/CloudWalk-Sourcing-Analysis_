@@ -137,6 +137,4 @@ Settings → Pages → branch `main`, folder `/ (root)`.
 - [ ] Slack digest (daily high-priority candidates)
 - [ ] Calibrated probability model (requires real data + hold-out)
 
-## License
 
-MIT
